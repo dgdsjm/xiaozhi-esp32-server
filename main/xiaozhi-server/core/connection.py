@@ -320,104 +320,122 @@ class ConnectionHandler:
             self.asr_server_receive = True
     
     
-    async def handle_audio_message(self, websocket, data):
-        """处理音频消息"""
-        try:
-            # 获取音频数据
-            audio_data = data.get("payload")
-            if not audio_data:
-                self.logger.bind(tag=TAG).warning("Received empty audio data")
-                return
+async def handle_audio_message(self, websocket, data):
+    """处理音频消息"""
+    try:
+        # 获取音频数据
+        audio_data = data.get("payload")
+        if not audio_data:
+            self.logger.bind(tag=TAG).warning("Received empty audio data")
+            return
 
-            # 检查当前是否允许接收音频
-            if not self.asr_server_receive:
-                self.logger.bind(tag=TAG).debug("服务端正在讲话，忽略音频输入")
-                return
+        # 检查当前是否允许接收音频
+        if not self.asr_server_receive:
+            self.logger.bind(tag=TAG).debug("服务端正在讲话，忽略音频输入")
+            return
+            
+        # 检查是否应该使用Gemini Live API直接处理音频
+        if self.use_gemini_live and self.gemini_live_audio_input and self.gemini_live_session:
+            # 如果当前正在播放且需要允许打断，可以取消注释以下代码：
+            if self.is_speaking:
+                self.logger.bind(tag=TAG).info("检测到用户音频输入，停止当前播放")
+                self.should_stop_speaking = True
+                await asyncio.sleep(0.1)  # 短暂等待确保停止状态被处理
+                
+            # 使用Gemini Live API直接处理音频
+            self.logger.bind(tag=TAG).debug("使用Gemini Live处理音频输入")
+            turn = await self.llm.send_audio_to_live_session(self.gemini_live_session, audio_data)
+            if turn:
+                # 将响应放入队列进行处理
+                await self.gemini_response_queue.put(turn)
+                self.logger.bind(tag=TAG).debug("已将Gemini响应放入队列")
+            return
 
-            # 添加到音频缓冲区
-            self.client_audio_buffer.extend(audio_data)
+        # 以下是传统的VAD+ASR+LLM+TTS处理流程
+        # 添加到音频缓冲区
+        self.client_audio_buffer.extend(audio_data)
+        
+        # 使用VAD检测语音活动
+        have_voice, is_speaking_done = self.vad.detect(self.client_audio_buffer)
+        
+        current_time = time.time()
+        
+        # 处理语音检测结果
+        if have_voice and not self.client_have_voice:
+            # 检测到语音开始
+            self.client_have_voice = True
+            self.client_have_voice_last_time = current_time
+            self.client_voice_stop = False
+            self.asr_audio = []
+            # 发送语音检测开始状态
+            await websocket.send(json.dumps({
+                "type": "vad",
+                "state": "start",
+                "session_id": self.session_id
+            }))
             
-            # 使用VAD检测语音活动
-            have_voice, is_speaking_done = self.vad.detect(self.client_audio_buffer)
+        if self.client_have_voice:
+            # 当检测到语音时，添加到ASR音频缓冲区
+            self.asr_audio.append(bytes(self.client_audio_buffer))
+            self.client_audio_buffer = bytearray()
             
-            current_time = time.time()
-            
-            # 处理语音检测结果
-            if have_voice and not self.client_have_voice:
-                # 检测到语音开始
-                self.client_have_voice = True
-                self.client_have_voice_last_time = current_time
-                self.client_voice_stop = False
-                self.asr_audio = []
-                # 发送语音检测开始状态
+            # 检查语音是否结束
+            if is_speaking_done or (current_time - self.client_have_voice_last_time > 2.0):
+                # 语音结束，进行ASR处理
+                self.client_voice_stop = True
+                self.client_have_voice = False
+                
+                # 发送语音检测结束状态
                 await websocket.send(json.dumps({
                     "type": "vad",
-                    "state": "start",
+                    "state": "stop",
                     "session_id": self.session_id
                 }))
                 
-            if self.client_have_voice:
-                # 当检测到语音时，添加到ASR音频缓冲区
-                self.asr_audio.append(bytes(self.client_audio_buffer))
-                self.client_audio_buffer = bytearray()
-                
-                # 检查语音是否结束
-                if is_speaking_done or (current_time - self.client_have_voice_last_time > 2.0):
-                    # 语音结束，进行ASR处理
-                    self.client_voice_stop = True
-                    self.client_have_voice = False
+                # 如果有足够的音频数据，进行ASR识别
+                if len(self.asr_audio) > 0:
+                    # 确保服务端不再接收音频，避免多次处理同一段语音
+                    self.asr_server_receive = False
                     
-                    # 发送语音检测结束状态
-                    await websocket.send(json.dumps({
-                        "type": "vad",
-                        "state": "stop",
-                        "session_id": self.session_id
-                    }))
+                    # 合并所有音频数据
+                    audio_data = b''.join(self.asr_audio)
+                    self.asr_audio = []
                     
-                    # 如果有足够的音频数据，进行ASR识别
-                    if len(self.asr_audio) > 0:
-                        # 确保服务端不再接收音频，避免多次处理同一段语音
-                        self.asr_server_receive = False
+                    # 执行ASR识别
+                    recognized_text = await self.asr.recognize(audio_data)
+                    if recognized_text and len(recognized_text.strip()) > 0:
+                        self.logger.bind(tag=TAG).info(f"ASR识别结果: {recognized_text}")
                         
-                        # 合并所有音频数据
-                        audio_data = b''.join(self.asr_audio)
-                        self.asr_audio = []
+                        # 发送ASR识别结果到客户端
+                        await websocket.send(json.dumps({
+                            "type": "asrResult",
+                            "payload": recognized_text,
+                            "session_id": self.session_id
+                        }))
                         
-                        # 执行ASR识别
-                        recognized_text = await self.asr.recognize(audio_data)
-                        if recognized_text and len(recognized_text.strip()) > 0:
-                            self.logger.bind(tag=TAG).info(f"ASR识别结果: {recognized_text}")
-                            
-                            # 发送ASR识别结果到客户端
-                            await websocket.send(json.dumps({
-                                "type": "asrResult",
-                                "payload": recognized_text,
-                                "session_id": self.session_id
-                            }))
-                            
-                            # 重置客户端打断标志
-                            self.client_abort = False
-                            
-                            # 使用LLM处理识别的文本
-                            if self.use_function_call_mode:
-                                await self.chat_with_function_calling(recognized_text)
-                            else:
-                                await self.chat(recognized_text)
+                        # 重置客户端打断标志
+                        self.client_abort = False
+                        
+                        # 使用LLM处理识别的文本
+                        if self.use_function_call_mode:
+                            await self.chat_with_function_calling(recognized_text)
                         else:
-                            self.logger.bind(tag=TAG).warning("ASR识别为空，忽略")
-                            self.asr_server_receive = True
+                            await self.chat(recognized_text)
                     else:
-                        self.logger.bind(tag=TAG).warning("音频数据为空，忽略")
+                        self.logger.bind(tag=TAG).warning("ASR识别为空，忽略")
                         self.asr_server_receive = True
-                        
-                    # 重置VAD状态
-                    self.reset_vad_states()
-            
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            self.logger.bind(tag=TAG).error(f"处理音频消息出错: {str(e)}\n{stack_trace}")
-            self.asr_server_receive = True
-            self.reset_vad_states()
+                else:
+                    self.logger.bind(tag=TAG).warning("音频数据为空，忽略")
+                    self.asr_server_receive = True
+                    
+                # 重置VAD状态
+                self.reset_vad_states()
+        
+    except Exception as e:
+        stack_trace = traceback.format_exc()
+        self.logger.bind(tag=TAG).error(f"处理音频消息出错: {str(e)}\n{stack_trace}")
+        self.asr_server_receive = True
+        self.reset_vad_states()
 
     async def handle_stop_tts(self, websocket):
         """处理停止TTS请求"""
