@@ -331,8 +331,22 @@ async def handle_audio_message(self, websocket, data):
 
         # 检查当前是否允许接收音频
         if not self.asr_server_receive:
-            self.logger.bind(tag=TAG).debug("服务端正在讲话，忽略音频输入")
-            return
+            # 不直接返回，而是检测是否有明确的语音活动以执行打断
+            if self.is_speaking:
+                # 添加到缓冲区并进行VAD检测
+                self.client_audio_buffer.extend(audio_data)
+                have_voice, _ = self.vad.detect(self.client_audio_buffer)
+                
+                if have_voice:  # 如果检测到明确的语音活动，执行打断
+                    self.logger.bind(tag=TAG).info("检测到用户打断，停止当前TTS")
+                    self.should_stop_speaking = True
+                    await self.send_tts_status(websocket, "stop")
+                    self.asr_server_receive = True  # 恢复接收状态
+                    # 继续正常处理这段音频...
+                else:
+                    return  # 如果没有明确的语音，仍然忽略
+            else:
+                return  # 如果不是在说话，则忽略
             
         # 检查是否应该使用Gemini Live API直接处理音频
         if self.use_gemini_live and self.gemini_live_audio_input and self.gemini_live_session:
