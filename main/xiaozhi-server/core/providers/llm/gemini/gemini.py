@@ -150,21 +150,67 @@ class LLMProvider(LLMProviderBase):
         except Exception as e:
             yield f"发生错误：{e}"
 
-<<<<<<< HEAD
-    def response_with_functions(self, session_id, dialogue, functions=None):
-        logger.bind(tag=TAG).info(f"gemini暂未实现完整的工具调用（function call）")
-        return self.response(session_id, dialogue)
-=======
-    # Live API 相关方法...
+    # Live API 相关方法
     async def create_live_session(self):
         """创建与Gemini Live API的会话，根据配置决定响应模态"""
-        # 实现保持不变...
+        if not self.live_client:
+            logger.bind(tag=TAG).error("Gemini Live API未初始化")
+            return None
+            
+        # 根据配置确定响应模态
+        response_modalities = ["TEXT"]  # 始终包含文本响应
+        if self.live_audio_output:
+            response_modalities.append("AUDIO")
+            
+        config = {
+            "response_modalities": response_modalities
+        }
+        
+        try:
+            session = await self.live_client.aio.live.connect(model=self.live_model, config=config)
+            logger.bind(tag=TAG).info(f"已创建Gemini Live会话，响应模态: {response_modalities}")
+            return session
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"创建Gemini Live会话失败: {e}")
+            return None
             
     async def send_audio_to_live_session(self, session, audio_data):
         """向Live会话发送音频数据并获取响应"""
-        # 实现保持不变...
+        if not session:
+            logger.bind(tag=TAG).error("无活动的Gemini Live会话")
+            return None
+            
+        try:
+            # 发送音频数据
+            await session.send(input={"mime_type": "audio/pcm", "data": audio_data})
+            # 标记结束用户输入轮次
+            await session.send(end_of_turn=True)
+            
+            # 返回响应生成器
+            logger.bind(tag=TAG).debug("已发送音频到Gemini Live会话，等待响应")
+            return session.receive()
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"发送音频到Gemini Live会话失败: {e}")
+            return None
             
     async def send_text_to_live_session(self, session, text):
         """向Live会话发送文本并获取响应"""
-        # 实现保持不变...
->>>>>>> 69e8598 (添加部分修改)
+        if not session:
+            logger.bind(tag=TAG).error("无活动的Gemini Live会话")
+            return None
+            
+        try:
+            # 发送文本
+            await session.send(input=text, end_of_turn=True)
+            
+            # 返回响应生成器
+            logger.bind(tag=TAG).debug(f"已发送文本到Gemini Live会话: '{text}'")
+            return session.receive()
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"发送文本到Gemini Live会话失败: {e}")
+            return None
+    
+    async def response_with_functions(self, session_id, dialogue, functions=None):
+        """与工具调用集成的响应方法"""
+        logger.bind(tag=TAG).info(f"gemini暂未实现完整的工具调用（function call）")
+        return self.response(session_id, dialogue)
