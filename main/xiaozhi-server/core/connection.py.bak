@@ -21,14 +21,17 @@ from core.utils.util import (
     initialize_modules,
 )
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from core.handle.sendAudioHandle import sendAudioMessage
 from core.handle.receiveAudioHandle import handleAudioMessage
 from core.handle.functionHandler import FunctionHandler
 from plugins_func.register import Action, ActionResponse
 from core.auth import AuthMiddleware, AuthenticationError
 from core.mcp.manager import MCPManager
-from config.config_loader import get_private_config_from_api
-from config.manage_api_client import DeviceNotFoundException, DeviceBindException
-from core.utils.output_counter import add_device_output
+from config.config_loader import (
+    get_private_config_from_api,
+    DeviceNotFoundException,
+    DeviceBindException,
+)
 
 TAG = __name__
 
@@ -57,13 +60,10 @@ class ConnectionHandler:
         self.session_id = None
         self.prompt = None
         self.welcome_msg = None
-        self.max_output_size = 0
 
         # 客户端状态相关
         self.client_abort = False
         self.client_listen_mode = "auto"
-        self.is_speaking = False
-        self.should_stop_speaking = False
 
         # 线程任务相关
         self.loop = asyncio.get_event_loop()
@@ -111,57 +111,11 @@ class ConnectionHandler:
 
         self.close_after_chat = False  # 是否在聊天结束后关闭连接
         self.use_function_call_mode = False
-        # 添加Gemini Live API支持 - 细分控制
-        self.use_gemini_live = False
-        self.gemini_live_audio_input = False
-        self.gemini_live_audio_output = False
-    
-        # 检查LLM类型是否为Gemini
-        if hasattr(self.llm, '__class__') and self.llm.__class__.__name__ == 'LLMProvider' and hasattr(self.llm, 'use_live_api'):
-            # 从LLM实例直接获取配置
-            self.use_gemini_live = self.llm.use_live_api
-            self.gemini_live_audio_input = getattr(self.llm, 'live_audio_input', False)
-            self.gemini_live_audio_output = getattr(self.llm, 'live_audio_output', False)
-            
-            # 检查是否启用了任何live特性
-            if self.use_gemini_live or self.gemini_live_audio_input or self.gemini_live_audio_output:
-                self.logger.bind(tag=TAG).info(f"检测到Gemini Live API配置：音频输入={self.gemini_live_audio_input}, 音频输出={self.gemini_live_audio_output}")
-        
-        # 初始化相关资源
-        self.gemini_live_session = None
-        self.gemini_response_queue = None
-        self.audio_response_task = None
-
-        self.timeout_task = None
-        self.timeout_seconds = (
-            int(self.config.get("close_connection_no_voice_time", 120)) + 60
-        )  # 在原来第一道关闭的基础上加60秒，进行二道关闭
 
     async def handle_connection(self, ws):
         try:
             # 获取并验证headers
             self.headers = dict(ws.request.headers)
-
-            if self.headers.get("device-id", None) is None:
-                # 尝试从 URL 的查询参数中获取 device-id
-                from urllib.parse import parse_qs, urlparse
-
-                # 从 WebSocket 请求中获取路径
-                request_path = ws.request.path
-                if not request_path:
-                    self.logger.bind(tag=TAG).error("无法获取请求路径")
-                    return
-                parsed_url = urlparse(request_path)
-                query_params = parse_qs(parsed_url.query)
-                if "device-id" in query_params:
-                    self.headers["device-id"] = query_params["device-id"][0]
-                    self.headers["client-id"] = query_params["client-id"][0]
-                else:
-                    self.logger.bind(tag=TAG).error(
-                        "无法从请求头和URL查询参数中获取device-id"
-                    )
-                    return
-
             # 获取客户端ip地址
             self.client_ip = ws.remote_address[0]
             self.logger.bind(tag=TAG).info(
@@ -174,29 +128,13 @@ class ConnectionHandler:
             # 认证通过,继续处理
             self.websocket = ws
             self.session_id = str(uuid.uuid4())
-             # 如果启用了Gemini Live API的任一功能，创建会话
-            if self.use_gemini_live and hasattr(self.llm, "create_live_session"):
-                self.gemini_response_queue = asyncio.Queue()
-                self.gemini_live_session = await self.llm.create_live_session()
-                if self.gemini_live_session:
-                    # 创建响应处理任务
-                    self.audio_response_task = asyncio.create_task(self._process_gemini_responses())
-                    mode_str = []
-                    if self.gemini_live_audio_input: mode_str.append("语音输入")
-                    if self.gemini_live_audio_output: mode_str.append("语音输出")
-                    self.logger.bind(tag=TAG).info(f"已创建Gemini Live会话，模式: {'+'.join(mode_str) or '仅文本'}")
-
-            # 启动超时检查任务
-            self.timeout_task = asyncio.create_task(self._check_timeout())
 
             self.welcome_msg = self.config["xiaozhi"]
             self.welcome_msg["session_id"] = self.session_id
             await self.websocket.send(json.dumps(self.welcome_msg))
 
-            # 获取差异化配置
-            private_config = self._initialize_private_config()
             # 异步初始化
-            self.executor.submit(self._initialize_components, private_config)
+            self.executor.submit(self._initialize_components)
             # tts 消化线程
             self.tts_priority_thread = threading.Thread(
                 target=self._tts_priority_thread, daemon=True
@@ -211,30 +149,7 @@ class ConnectionHandler:
 
             try:
                 async for message in self.websocket:
-                    try:
-                        # 检查消息类型
-                        if isinstance(message, str):
-                            try:
-                                data = json.loads(message)
-                                message_type = data.get("type", "")
-                                
-                                if message_type == "text":
-                                    await self.handle_text_message(ws, data)
-                                elif message_type == "audio":
-                                    await self.handle_audio_message(ws, data)
-                                elif message_type == "stopTTS":
-                                    await self.handle_stop_tts(ws)
-                                else:
-                                    # 使用现有的文本处理函数处理其他文本消息
-                                    await handleTextMessage(self, message)
-                            except json.JSONDecodeError:
-                                # 非JSON文本消息，使用现有的文本处理逻辑
-                                await handleTextMessage(self, message)
-                        elif isinstance(message, bytes):
-                            # 二进制数据，使用现有的音频处理逻辑
-                            await handleAudioMessage(self, message)
-                    except Exception as e:
-                        self.logger.bind(tag=TAG).error(f"Error processing message: {str(e)}")
+                    await self._route_message(message)
             except websockets.exceptions.ConnectionClosed:
                 self.logger.bind(tag=TAG).info("客户端断开连接")
 
@@ -257,257 +172,47 @@ class ConnectionHandler:
         finally:
             await self.close(ws)
 
-    async def handle_text_message(self, websocket, data):
-        """处理文本消息"""
-        text = data.get("payload", "")
-        if not text:
-            return
-            
-        self.logger.bind(tag=TAG).info(f"Received text: {text}")
-        
-        # 处理文本请求并获得回复
-        if self.use_function_call_mode:
-            await self.chat_with_function_calling(text)
-        else:
-            await self.chat(text)
-    
-    
-    async def _process_gemini_responses(self):
-        """处理来自Gemini Live API的响应（文本或音频）"""
-        try:
-            self.logger.bind(tag=TAG).info("启动Gemini响应处理任务")
-            while True:
-                if not self.gemini_live_session or not self.websocket:
-                    await asyncio.sleep(0.5)
-                    continue
-                    
-                # 获取下一个响应或等待
-                try:
-                    turn = await asyncio.wait_for(self.gemini_response_queue.get(), 0.5)
-                    
-                    # 如果启用了音频输出，则处理为TTS流
-                    has_audio_output = self.gemini_live_audio_output
-                    if has_audio_output:
-                        # 发送TTS开始状态
-                        await self.send_tts_status(self.websocket, "start", "")
-                        self.is_speaking = True
-                        self.asr_server_receive = False  # 播放时停止接收音频
-                    
-                    # 处理响应
-                    transcript = ""
-                    async for response in turn:
-                        if self.should_stop_speaking:
-                            break
-                            
-                        # 处理音频数据 (如果启用了语音输出)
-                        if has_audio_output and response.data:
-                            try:
-                                await self.websocket.send(response.data)
-                                await asyncio.sleep(0.01)
-                            except Exception as e:
-                                self.logger.bind(tag=TAG).error(f"发送音频数据失败: {e}")
-                                break
-                        
-                        # 处理文本响应
-                        if response.text:
-                            transcript += response.text
-                    
-                    # 如果没有语音输出或同时有文本，发送文本响应
-                    if transcript:
-                        # 发送完整转录文本
-                        await self.websocket.send(json.dumps({
-                            "type": "textResponse",
-                            "payload": transcript,
-                            "session_id": self.session_id
-                        }))
-                        
-                        # 如果没有语音输出但有文本，则用传统TTS播放
-                        if not has_audio_output:
-                            await self.stream_tts_response(self.websocket, transcript)
-                    
-                    # 发送TTS结束状态 (如果启用了语音输出)
-                    if has_audio_output:
-                        await self.send_tts_status(self.websocket, "stop")
-                        # 重置状态
-                        self.is_speaking = False
-                        self.asr_server_receive = True
-                    
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    self.logger.bind(tag=TAG).error(f"处理Gemini响应出错: {e}")
-                    self.is_speaking = False
-                    self.asr_server_receive = True
-                    
-        except asyncio.CancelledError:
-            self.logger.bind(tag=TAG).info("Gemini响应处理任务已取消")
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"Gemini响应处理任务出错: {e}")
-        finally:
-            self.is_speaking = False
-            self.asr_server_receive = True
-    
-    
-    async def handle_audio_message(self, websocket, data):
-        """处理音频消息"""
-        try:
-            # 获取音频数据
-            audio_data = data.get("payload")
-            if not audio_data:
-                self.logger.bind(tag=TAG).warning("Received empty audio data")
-                return
-
-            # 检查当前是否允许接收音频
-            if not self.asr_server_receive:
-                self.logger.bind(tag=TAG).debug("服务端正在讲话，忽略音频输入")
-                return
-
-            # 添加到音频缓冲区
-            self.client_audio_buffer.extend(audio_data)
-            
-            # 使用VAD检测语音活动
-            have_voice, is_speaking_done = self.vad.detect(self.client_audio_buffer)
-            
-            current_time = time.time()
-            
-            # 处理语音检测结果
-            if have_voice and not self.client_have_voice:
-                # 检测到语音开始
-                self.client_have_voice = True
-                self.client_have_voice_last_time = current_time
-                self.client_voice_stop = False
-                self.asr_audio = []
-                # 发送语音检测开始状态
-                await websocket.send(json.dumps({
-                    "type": "vad",
-                    "state": "start",
-                    "session_id": self.session_id
-                }))
-                
-            if self.client_have_voice:
-                # 当检测到语音时，添加到ASR音频缓冲区
-                self.asr_audio.append(bytes(self.client_audio_buffer))
-                self.client_audio_buffer = bytearray()
-                
-                # 检查语音是否结束
-                if is_speaking_done or (current_time - self.client_have_voice_last_time > 2.0):
-                    # 语音结束，进行ASR处理
-                    self.client_voice_stop = True
-                    self.client_have_voice = False
-                    
-                    # 发送语音检测结束状态
-                    await websocket.send(json.dumps({
-                        "type": "vad",
-                        "state": "stop",
-                        "session_id": self.session_id
-                    }))
-                    
-                    # 如果有足够的音频数据，进行ASR识别
-                    if len(self.asr_audio) > 0:
-                        # 确保服务端不再接收音频，避免多次处理同一段语音
-                        self.asr_server_receive = False
-                        
-                        # 合并所有音频数据
-                        audio_data = b''.join(self.asr_audio)
-                        self.asr_audio = []
-                        
-                        # 执行ASR识别
-                        recognized_text = await self.asr.recognize(audio_data)
-                        if recognized_text and len(recognized_text.strip()) > 0:
-                            self.logger.bind(tag=TAG).info(f"ASR识别结果: {recognized_text}")
-                            
-                            # 发送ASR识别结果到客户端
-                            await websocket.send(json.dumps({
-                                "type": "asrResult",
-                                "payload": recognized_text,
-                                "session_id": self.session_id
-                            }))
-                            
-                            # 重置客户端打断标志
-                            self.client_abort = False
-                            
-                            # 使用LLM处理识别的文本
-                            if self.use_function_call_mode:
-                                await self.chat_with_function_calling(recognized_text)
-                            else:
-                                await self.chat(recognized_text)
-                        else:
-                            self.logger.bind(tag=TAG).warning("ASR识别为空，忽略")
-                            self.asr_server_receive = True
-                    else:
-                        self.logger.bind(tag=TAG).warning("音频数据为空，忽略")
-                        self.asr_server_receive = True
-                        
-                    # 重置VAD状态
-                    self.reset_vad_states()
-            
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            self.logger.bind(tag=TAG).error(f"处理音频消息出错: {str(e)}\n{stack_trace}")
-            self.asr_server_receive = True
-            self.reset_vad_states()
-
-    async def handle_stop_tts(self, websocket):
-        """处理停止TTS请求"""
-        self.logger.bind(tag=TAG).info("Received stop TTS request")
-        self.should_stop_speaking = True
-        self.client_abort = True
-        if self.is_speaking:
-            await self.send_tts_status(websocket, "stop")
-
-    async def send_tts_status(self, websocket, state, text=None):
-        """发送TTS状态消息"""
-        message = {
-            "type": "tts",
-            "state": state,  # "start" 或 "stop"
-            "session_id": self.session_id
-        }
-        if text is not None:
-            message["text"] = text
-            
-        await websocket.send(json.dumps(message))
-
     async def _route_message(self, message):
         """消息路由"""
-        # 重置超时计时器
-        if self.timeout_task:
-            self.timeout_task.cancel()
-            self.timeout_task = asyncio.create_task(self._check_timeout())
-
         if isinstance(message, str):
             await handleTextMessage(self, message)
         elif isinstance(message, bytes):
             await handleAudioMessage(self, message)
 
-    def _initialize_components(self, private_config):
+    def _initialize_components(self):
         """初始化组件"""
-        if private_config is not None:
-            self._initialize_models(private_config)
-        else:
-            self.prompt = self.config["prompt"]
-            self.change_system_prompt(self.prompt)
+        self._initialize_models()
+
+        """加载提示词"""
+        self.prompt = self.config["prompt"]
+        self.dialogue.put(Message(role="system", content=self.prompt))
+
         """加载记忆"""
         self._initialize_memory()
         """加载意图识别"""
         self._initialize_intent()
+        """加载位置信息"""
+        self.client_ip_info = get_ip_info(self.client_ip, self.logger)
+        if self.client_ip_info is not None and "city" in self.client_ip_info:
+            self.logger.bind(tag=TAG).info(f"Client ip info: {self.client_ip_info}")
+            self.prompt = self.prompt + f"\nuser location:{self.client_ip_info}"
 
-    def _initialize_private_config(self):
+            self.dialogue.update_system_message(self.prompt)
+
+    def _initialize_models(self):
         read_config_from_api = self.config.get("read_config_from_api", False)
         """如果是从配置文件获取，则进行二次实例化"""
         if not read_config_from_api:
             return
         """从接口获取差异化的配置进行二次实例化，非全量重新实例化"""
         try:
-            begin_time = time.time()
             private_config = get_private_config_from_api(
                 self.config,
-                self.headers.get("device-id"),
-                self.headers.get("client-id", self.headers.get("device-id")),
+                self.headers.get("device-id", None),
+                self.headers.get("client-id", None),
             )
             private_config["delete_audio"] = bool(self.config.get("delete_audio", True))
-            self.logger.bind(tag=TAG).info(
-                f"{time.time() - begin_time} 秒，获取差异化配置成功: {private_config}"
-            )
+            self.logger.bind(tag=TAG).info(f"获取差异化配置成功: {private_config}")
         except DeviceNotFoundException as e:
             self.need_bind = True
             private_config = {}
@@ -520,37 +225,8 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"获取差异化配置失败: {e}")
             private_config = {}
 
-        init_tts = False
-        if private_config.get("TTS", None) is not None:
-            init_tts = True
-            self.config["TTS"] = private_config["TTS"]
-            self.config["selected_module"]["TTS"] = private_config["selected_module"][
-                "TTS"
-            ]
-
-        try:
-            modules = initialize_modules(
-                self.logger,
-                private_config,
-                False,
-                False,
-                False,
-                init_tts,
-                False,
-                False,
-            )
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"初始化组件失败: {e}")
-            modules = {}
-        if modules.get("tts", None) is not None:
-            self.tts = modules["tts"]
-        if modules.get("prompt", None) is not None:
-            self.change_system_prompt(modules["prompt"])
-            private_config["prompt"] = None
-        return private_config
-
-    def _initialize_models(self, private_config):
-        init_vad, init_asr, init_llm, init_memory, init_intent = (
+        init_vad, init_asr, init_llm, init_tts, init_memory, init_intent = (
+            False,
             False,
             False,
             False,
@@ -575,6 +251,12 @@ class ConnectionHandler:
             self.config["selected_module"]["LLM"] = private_config["selected_module"][
                 "LLM"
             ]
+        if private_config.get("TTS", None) is not None:
+            init_tts = True
+            self.config["TTS"] = private_config["TTS"]
+            self.config["selected_module"]["TTS"] = private_config["selected_module"][
+                "TTS"
+            ]
         if private_config.get("Memory", None) is not None:
             init_memory = True
             self.config["Memory"] = private_config["Memory"]
@@ -587,8 +269,6 @@ class ConnectionHandler:
             self.config["selected_module"]["Intent"] = private_config[
                 "selected_module"
             ]["Intent"]
-        if private_config.get("device_max_output_size", None) is not None:
-            self.max_output_size = int(private_config["device_max_output_size"])
         try:
             modules = initialize_modules(
                 self.logger,
@@ -596,7 +276,7 @@ class ConnectionHandler:
                 init_vad,
                 init_asr,
                 init_llm,
-                False,
+                init_tts,
                 init_memory,
                 init_intent,
             )
@@ -607,12 +287,16 @@ class ConnectionHandler:
             self.vad = modules["vad"]
         if modules.get("asr", None) is not None:
             self.asr = modules["asr"]
+        if modules.get("tts", None) is not None:
+            self.tts = modules["tts"]
         if modules.get("llm", None) is not None:
             self.llm = modules["llm"]
         if modules.get("intent", None) is not None:
             self.intent = modules["intent"]
         if modules.get("memory", None) is not None:
             self.memory = modules["memory"]
+        if modules.get("prompt", None) is not None:
+            self.change_system_prompt(modules["prompt"])
 
     def _initialize_memory(self):
         """初始化记忆模块"""
@@ -673,15 +357,19 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
-    async def chat(self, query):
-        """使用流式TTS进行对话"""
+    def chat(self, query):
+
         self.dialogue.put(Message(role="user", content=query))
 
         response_message = []
         processed_chars = 0  # 跟踪已处理的字符位置
         try:
             # 使用带记忆的对话
-            memory_str = await self.memory.query_memory(query)
+            future = asyncio.run_coroutine_threadsafe(
+                self.memory.query_memory(query), self.loop
+            )
+            memory_str = future.result()
+
             self.logger.bind(tag=TAG).debug(f"记忆内容: {memory_str}")
             llm_responses = self.llm.response(
                 self.session_id, self.dialogue.get_llm_dialogue_with_memory(memory_str)
@@ -714,11 +402,15 @@ class ConnectionHandler:
                 segment_text_raw = current_text[: last_punct_pos + 1]
                 segment_text = get_string_no_punctuation_or_emoji(segment_text_raw)
                 if segment_text:
+                    # 强制设置空字符，测试TTS出错返回语音的健壮性
+                    # if text_index % 2 == 0:
+                    #     segment_text = " "
                     text_index += 1
                     self.recode_first_last_text(segment_text, text_index)
-                    
-                    # 使用流式TTS处理
-                    await self.stream_tts_response(self.websocket, segment_text)
+                    future = self.executor.submit(
+                        self.speak_and_play, segment_text, text_index
+                    )
+                    self.tts_queue.put(future)
                     processed_chars += len(segment_text_raw)  # 更新已处理字符位置
 
         # 处理最后剩余的文本
@@ -729,7 +421,10 @@ class ConnectionHandler:
             if segment_text:
                 text_index += 1
                 self.recode_first_last_text(segment_text, text_index)
-                await self.stream_tts_response(self.websocket, segment_text)
+                future = self.executor.submit(
+                    self.speak_and_play, segment_text, text_index
+                )
+                self.tts_queue.put(future)
 
         self.llm_finish_task = True
         self.dialogue.put(Message(role="assistant", content="".join(response_message)))
@@ -738,81 +433,7 @@ class ConnectionHandler:
         )
         return True
 
-    async def stream_tts_response(self, websocket, text):
-        """流式发送TTS音频"""
-        if not text:
-            return
-            
-        self.should_stop_speaking = False
-        self.is_speaking = True
-        self.asr_server_receive = False  # 发言时不接收音频输入
-        
-        try:
-            # 发送TTS开始状态
-            await self.send_tts_status(websocket, "start", text)
-            
-            try:
-                # 尝试使用流式生成 (如果TTS引擎支持)
-                if hasattr(self.tts, 'generate_streaming'):
-                    # 直接从TTS引擎获取流式音频
-                    audio_stream = self.tts.generate_streaming(text)
-                    
-                    # 发送音频数据
-                    async for audio_chunk in audio_stream:
-                        # 检查是否应该停止
-                        if self.should_stop_speaking or websocket.closed:
-                            break
-                            
-                        # 发送二进制音频数据
-                        await websocket.send(audio_chunk)
-                        
-                        # 控制发送速率
-                        delay = self.config.get("tts_stream_delay", 0.01)
-                        await asyncio.sleep(delay)
-                else:
-                    # TTS引擎不支持流式生成，回退到传统方法
-                    self.logger.bind(tag=TAG).info("TTS引擎不支持流式生成，回退到传统方法")
-                    
-                    # 使用传统方法生成TTS文件
-                    tts_file = self.tts.to_tts(text)
-                    
-                    if tts_file and os.path.exists(tts_file):
-                        try:
-                            # 转换为opus格式并发送
-                            opus_datas, _ = self.tts.audio_to_opus_data(tts_file)
-                            
-                            for data in opus_datas:
-                                if self.should_stop_speaking or websocket.closed:
-                                    break
-                                await websocket.send(data)
-                                await asyncio.sleep(0.01)
-                                
-                            # 完成后清理文件
-                            if self.tts.delete_audio_file:
-                                os.remove(tts_file)
-                        except Exception as inner_e:
-                            self.logger.bind(tag=TAG).error(f"处理TTS文件时出错: {str(inner_e)}")
-                    else:
-                        self.logger.bind(tag=TAG).error(f"TTS文件生成失败: {tts_file}")
-                    
-            except Exception as e:
-                self.logger.bind(tag=TAG).error(f"TTS处理出错: {str(e)}")
-                # 出错时也尝试发送停止状态
-                if not websocket.closed:
-                    await self.send_tts_status(websocket, "stop")
-                    
-            # 发送TTS结束状态
-            if not websocket.closed:
-                await self.send_tts_status(websocket, "stop")
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"流式TTS处理失败: {str(e)}")
-            if not websocket.closed:
-                await self.send_tts_status(websocket, "stop")
-        finally:
-            self.is_speaking = False
-            self.asr_server_receive = True  # 恢复音频接收
-
-    async def chat_with_function_calling(self, query, tool_call=False):
+    def chat_with_function_calling(self, query, tool_call=False):
         self.logger.bind(tag=TAG).debug(f"Chat with function calling start: {query}")
         """Chat with function calling for intent detection using streaming"""
 
@@ -830,7 +451,10 @@ class ConnectionHandler:
             start_time = time.time()
 
             # 使用带记忆的对话
-            memory_str = await self.memory.query_memory(query)
+            future = asyncio.run_coroutine_threadsafe(
+                self.memory.query_memory(query), self.loop
+            )
+            memory_str = future.result()
 
             # self.logger.bind(tag=TAG).info(f"对话记录: {self.dialogue.get_llm_dialogue_with_memory(memory_str)}")
 
@@ -853,19 +477,16 @@ class ConnectionHandler:
         function_id = None
         function_arguments = ""
         content_arguments = ""
-
         for response in llm_responses:
             content, tools_call = response
-
             if "content" in response:
                 content = response["content"]
                 tools_call = None
             if content is not None and len(content) > 0:
-                content_arguments += content
-
-            if not tool_call_flag and content_arguments.startswith("<tool_call>"):
-                # print("content_arguments", content_arguments)
-                tool_call_flag = True
+                if len(response_message) <= 0 and (
+                    content == "```" or "<tool_call>" in content
+                ):
+                    tool_call_flag = True
 
             if tools_call is not None:
                 tool_call_flag = True
@@ -877,7 +498,9 @@ class ConnectionHandler:
                     function_arguments += tools_call[0].function.arguments
 
             if content is not None and len(content) > 0:
-                if not tool_call_flag:
+                if tool_call_flag:
+                    content_arguments += content
+                else:
                     response_message.append(content)
 
                     if self.client_abort:
@@ -908,9 +531,12 @@ class ConnectionHandler:
                         if segment_text:
                             text_index += 1
                             self.recode_first_last_text(segment_text, text_index)
-                            # 使用流式TTS处理
-                            await self.stream_tts_response(self.websocket, segment_text)
-                            processed_chars += len(segment_text_raw)  # 更新已处理字符位置
+                            future = self.executor.submit(
+                                self.speak_and_play, segment_text, text_index
+                            )
+                            self.tts_queue.put(future)
+                            # 更新已处理字符位置
+                            processed_chars += len(segment_text_raw)
 
         # 处理function call
         if tool_call_flag:
@@ -935,9 +561,10 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).error(
                         f"function call error: {content_arguments}"
                     )
+                else:
+                    function_arguments = json.loads(function_arguments)
             if not bHasError:
-                response_message.clear()
-                self.logger.bind(tag=TAG).debug(
+                self.logger.bind(tag=TAG).info(
                     f"function_name={function_name}, function_id={function_id}, function_arguments={function_arguments}"
                 )
                 function_call_data = {
@@ -948,13 +575,13 @@ class ConnectionHandler:
 
                 # 处理MCP工具调用
                 if self.mcp_manager.is_mcp_tool(function_name):
-                    result = await self._handle_mcp_tool_call(function_call_data)
+                    result = self._handle_mcp_tool_call(function_call_data)
                 else:
                     # 处理系统函数
                     result = self.func_handler.handle_llm_function_call(
                         self, function_call_data
                     )
-                await self._handle_function_result(result, function_call_data, text_index + 1)
+                self._handle_function_result(result, function_call_data, text_index + 1)
 
         # 处理最后剩余的文本
         full_text = "".join(response_message)
@@ -964,7 +591,10 @@ class ConnectionHandler:
             if segment_text:
                 text_index += 1
                 self.recode_first_last_text(segment_text, text_index)
-                await self.stream_tts_response(self.websocket, segment_text)
+                future = self.executor.submit(
+                    self.speak_and_play, segment_text, text_index
+                )
+                self.tts_queue.put(future)
 
         # 存储对话内容
         if len(response_message) > 0:
@@ -979,7 +609,7 @@ class ConnectionHandler:
 
         return True
 
-    async def _handle_mcp_tool_call(self, function_call_data):
+    def _handle_mcp_tool_call(self, function_call_data):
         function_arguments = function_call_data["arguments"]
         function_name = function_call_data["name"]
         try:
@@ -995,8 +625,9 @@ class ConnectionHandler:
                         action=Action.REQLLM, result="参数解析失败", response=""
                     )
 
-            tool_result = await self.mcp_manager.execute_tool(function_name, args_dict)
-            
+            tool_result = asyncio.run_coroutine_threadsafe(
+                self.mcp_manager.execute_tool(function_name, args_dict), self.loop
+            ).result()
             # meta=None content=[TextContent(type='text', text='北京当前天气:\n温度: 21°C\n天气: 晴\n湿度: 6%\n风向: 西北 风\n风力等级: 5级', annotations=None)] isError=False
             content_text = ""
             if tool_result is not None and tool_result.content is not None:
@@ -1020,13 +651,15 @@ class ConnectionHandler:
 
         return ActionResponse(action=Action.REQLLM, result="工具调用出错", response="")
 
-    async def _handle_function_result(self, result, function_call_data, text_index):
+    def _handle_function_result(self, result, function_call_data, text_index):
         if result.action == Action.RESPONSE:  # 直接回复前端
             text = result.response
             self.recode_first_last_text(text, text_index)
-            await self.stream_tts_response(self.websocket, text)
+            future = self.executor.submit(self.speak_and_play, text, text_index)
+            self.tts_queue.put(future)
             self.dialogue.put(Message(role="assistant", content=text))
         elif result.action == Action.REQLLM:  # 调用函数后再请求llm生成回复
+
             text = result.result
             if text is not None and len(text) > 0:
                 function_id = function_call_data["id"]
@@ -1052,26 +685,19 @@ class ConnectionHandler:
                 self.dialogue.put(
                     Message(role="tool", tool_call_id=function_id, content=text)
                 )
-<<<<<<< HEAD
                 self.chat_with_function_calling(text, tool_call=True)
-        elif result.action == Action.NOTFOUND or result.action == Action.ERROR:
-=======
-                await self.chat_with_function_calling(text, tool_call=True)
         elif result.action == Action.NOTFOUND:
->>>>>>> 69e8598 (添加部分修改)
             text = result.result
             self.recode_first_last_text(text, text_index)
-            await self.stream_tts_response(self.websocket, text)
+            future = self.executor.submit(self.speak_and_play, text, text_index)
+            self.tts_queue.put(future)
             self.dialogue.put(Message(role="assistant", content=text))
         else:
-<<<<<<< HEAD
-            pass
-=======
             text = result.result
             self.recode_first_last_text(text, text_index)
-            await self.stream_tts_response(self.websocket, text)
+            future = self.executor.submit(self.speak_and_play, text, text_index)
+            self.tts_queue.put(future)
             self.dialogue.put(Message(role="assistant", content=text))
->>>>>>> 69e8598 (添加部分修改)
 
     def _tts_priority_thread(self):
         while not self.stop_event.is_set():
@@ -1126,7 +752,15 @@ class ConnectionHandler:
                 self.logger.bind(tag=TAG).error(f"TTS任务处理错误: {e}")
                 self.clearSpeakStatus()
                 asyncio.run_coroutine_threadsafe(
-                    self.send_tts_status(self.websocket, "stop"),
+                    self.websocket.send(
+                        json.dumps(
+                            {
+                                "type": "tts",
+                                "state": "stop",
+                                "session_id": self.session_id,
+                            }
+                        )
+                    ),
                     self.loop,
                 )
                 self.logger.bind(tag=TAG).error(
@@ -1143,27 +777,10 @@ class ConnectionHandler:
                     if self.stop_event.is_set():
                         break
                     continue
-                
-                # 已改用流式TTS，此处为了兼容旧代码保留
-                asyncio.run_coroutine_threadsafe(
-                    self.send_tts_status(self.websocket, "start", text),
-                    self.loop
-                ).result()
-                
-                for data in opus_datas:
-                    if self.client_abort or self.should_stop_speaking:
-                        break
-                    asyncio.run_coroutine_threadsafe(
-                        self.websocket.send(data),
-                        self.loop
-                    ).result()
-                    time.sleep(0.01)
-                    
-                asyncio.run_coroutine_threadsafe(
-                    self.send_tts_status(self.websocket, "stop"),
-                    self.loop
-                ).result()
-                
+                future = asyncio.run_coroutine_threadsafe(
+                    sendAudioMessage(self, opus_datas, text, text_index), self.loop
+                )
+                future.result()
             except Exception as e:
                 self.logger.bind(tag=TAG).error(
                     f"audio_play_priority priority_thread: {text} {e}"
@@ -1178,8 +795,6 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"tts转换失败，{text}")
             return None, text, text_index
         self.logger.bind(tag=TAG).debug(f"TTS 文件生成完毕: {tts_file}")
-        if self.max_output_size > 0:
-            add_device_output(self.headers.get("device-id"), len(text))
         return tts_file, text, text_index
 
     def clearSpeakStatus(self):
@@ -1187,8 +802,6 @@ class ConnectionHandler:
         self.asr_server_receive = True
         self.tts_last_text_index = -1
         self.tts_first_text_index = -1
-        self.is_speaking = False
-        self.should_stop_speaking = False
 
     def recode_first_last_text(self, text, text_index=0):
         if self.tts_first_text_index == -1:
@@ -1198,11 +811,6 @@ class ConnectionHandler:
 
     async def close(self, ws=None):
         """资源清理方法"""
-        # 取消超时任务
-        if self.timeout_task:
-            self.timeout_task.cancel()
-            self.timeout_task = None
-
         # 清理MCP资源
         if hasattr(self, "mcp_manager") and self.mcp_manager:
             await self.mcp_manager.cleanup_all()
@@ -1217,7 +825,7 @@ class ConnectionHandler:
             self.executor = None
 
         # 清空任务队列
-        self.clear_queues()
+        self._clear_queues()
 
         if ws:
             await ws.close()
@@ -1225,11 +833,8 @@ class ConnectionHandler:
             await self.websocket.close()
         self.logger.bind(tag=TAG).info("连接资源已释放")
 
-    def clear_queues(self):
+    def _clear_queues(self):
         # 清空所有任务队列
-        self.logger.bind(tag=TAG).info(
-            f"开始清理: TTS队列大小={self.tts_queue.qsize()}, 音频队列大小={self.audio_play_queue.qsize()}"
-        )
         for q in [self.tts_queue, self.audio_play_queue]:
             if not q:
                 continue
@@ -1241,9 +846,6 @@ class ConnectionHandler:
             q.queue.clear()
             # 添加毒丸信号到队列，确保线程退出
             # q.queue.put(None)
-        self.logger.bind(tag=TAG).info(
-            f"清理结束: TTS队列大小={self.tts_queue.qsize()}, 音频队列大小={self.audio_play_queue.qsize()}"
-        )
 
     def reset_vad_states(self):
         self.client_audio_buffer = bytearray()
@@ -1261,20 +863,4 @@ class ConnectionHandler:
             # After chat is complete, close the connection
             self.close_after_chat = True
         except Exception as e:
-<<<<<<< HEAD
             self.logger.bind(tag=TAG).error(f"Chat and close error: {str(e)}")
-
-    async def _check_timeout(self):
-        """检查连接超时"""
-        try:
-            while not self.stop_event.is_set():
-                await asyncio.sleep(self.timeout_seconds)
-                if not self.stop_event.is_set():
-                    self.logger.bind(tag=TAG).info("连接超时，准备关闭")
-                    await self.close(self.websocket)
-                    break
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"超时检查任务出错: {e}")
-=======
-            self.logger.bind(tag=TAG).error(f"Chat and close error: {str(e)}")
->>>>>>> 69e8598 (添加部分修改)

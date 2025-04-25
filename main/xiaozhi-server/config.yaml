@@ -305,6 +305,10 @@ LLM:
     model_name: "gemini-2.0-flash"
     http_proxy: ""  #"http://127.0.0.1:10808"
     https_proxy: "" #http://127.0.0.1:10808"
+    use_live_api: false  
+    live_model": "models/gemini-2.0-flash-live-001"
+    live_audio_input": true  // 开启语音输入
+    live_audio_output": false  // 关闭语音输出，使用传统TTS
   CozeLLM:
     # 定义LLM API类型
     type: coze
